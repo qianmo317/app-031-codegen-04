@@ -108,9 +108,36 @@ function onUp(e: PointerEvent): void {
   ghost.value = null
 }
 
-function partCursor(): string {
-  return props.draggable ? 'grab' : 'default'
-}
+const partCursor = computed(() => (props.draggable ? 'grab' : 'default'))
+
+const grainOverlays = computed(() => {
+  const map = new Map<string, typeof props.sheet.placements>()
+  for (const p of props.sheet.placements) {
+    const code = p.grainSegmentCode || p.grainGroupCode
+    if (!code) continue
+    map.set(code, [...(map.get(code) ?? []), p])
+  }
+  return [...map.entries()].map(([code, list]) => {
+    const ordered = [...list].sort((a, b) => (a.grainOrder ?? 0) - (b.grainOrder ?? 0))
+    return {
+      code,
+      split: code.includes('-'),
+      x: Math.min(...list.map((p) => p.x)),
+      y: Math.min(...list.map((p) => p.y)),
+      w: Math.max(...list.map((p) => p.x + p.lenMm)) - Math.min(...list.map((p) => p.x)),
+      h: Math.max(...list.map((p) => p.y + p.widMm)) - Math.min(...list.map((p) => p.y)),
+      joints: ordered.slice(0, -1).map((p, i) => {
+        const q = ordered[i + 1]
+        const verticalChain = Math.abs(p.x - q.x) < 1
+        return {
+          x: verticalChain ? p.x + Math.min(p.lenMm, q.lenMm) / 2 : p.x + p.lenMm,
+          y: verticalChain ? p.y + p.widMm : p.y + Math.min(p.widMm, q.widMm) / 2,
+          verticalChain
+        }
+      })
+    }
+  })
+})
 </script>
 
 <template>
@@ -181,7 +208,7 @@ function partCursor(): string {
         :fill="cabinetFill(p.cabinet)"
         :stroke="cabinetStroke(p.cabinet)"
         :stroke-width="selectedId === p.instanceId ? 3 : 1.4"
-        :style="{ cursor: partCursor() }"
+        :style="{ cursor: partCursor }"
         @pointerdown="onDown($event, p.instanceId)"
         @click="emit('select', p.instanceId)"
       />
@@ -194,7 +221,7 @@ function partCursor(): string {
         class="part-label"
         :font-size="label(p.lenMm, p.widMm).fontSize"
         :font-weight="label(p.lenMm, p.widMm).showDims ? 700 : 600"
-        :style="{ cursor: partCursor() }"
+        :style="{ cursor: partCursor }"
         @pointerdown="onDown($event, p.instanceId)"
       >
         <tspan v-if="label(p.lenMm, p.widMm).showCode" x="50%" dy="0">{{ p.code }}</tspan>
@@ -213,6 +240,35 @@ function partCursor(): string {
         :fill="cabinetStroke(p.cabinet)"
       />
       <title>{{ p.code }} {{ p.name }} {{ p.origLen }}×{{ p.origWid }}（{{ p.cabinet }}）</title>
+    </g>
+    <!-- 成组连纹：粗框/箭头标记使用统一 segmentCode，拆段后缀 A/B 即断口 -->
+    <g v-for="g in grainOverlays" :key="'grain' + g.code" class="grain-overlay" pointer-events="none">
+      <rect
+        :x="g.x - 5"
+        :y="g.y - 5"
+        :width="g.w + 10"
+        :height="g.h + 10"
+        fill="none"
+        :stroke="g.split ? '#dc2626' : '#7c3aed'"
+        stroke-width="4"
+        stroke-dasharray="g.split ? '14 7' : 'none'"
+        rx="4"
+      />
+      <text
+        :x="g.x"
+        :y="g.y - 10"
+        :class="g.split ? 'grain-code split' : 'grain-code'"
+      >{{ g.code }}{{ g.split ? ' 断口段' : ' 连纹' }}</text>
+      <g v-for="(j, i) in g.joints" :key="i">
+        <line
+          :x1="j.verticalChain ? j.x - 16 : j.x"
+          :y1="j.verticalChain ? j.y : j.y - 16"
+          :x2="j.verticalChain ? j.x + 16 : j.x"
+          :y2="j.verticalChain ? j.y : j.y + 16"
+          stroke="#7c3aed"
+          stroke-width="3"
+        />
+      </g>
     </g>
     <!-- 刀路播放 -->
     <g v-if="showCuts">
@@ -273,6 +329,20 @@ function partCursor(): string {
 }
 :global(.dragging) rect {
   opacity: 0.55;
+}
+.grain-overlay {
+  pointer-events: none;
+}
+.grain-code {
+  font-size: 18px;
+  font-weight: 800;
+  fill: #7c3aed;
+  paint-order: stroke;
+  stroke: #fff;
+  stroke-width: 4px;
+}
+.grain-code.split {
+  fill: #dc2626;
 }
 .active-cut {
   filter: drop-shadow(0 0 3px rgba(220, 38, 38, 0.7));

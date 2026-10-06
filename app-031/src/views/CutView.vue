@@ -134,6 +134,7 @@ function printCut(): void {
           @click="jumpTo(st.order)"
         >
           <span class="n">{{ st.order + 1 }}</span>
+          <span v-if="st.grainSegmentCodes?.length" class="g-cut">{{ st.grainSegmentCodes.join('/') }}</span>
           <span class="t">{{ st.label }}</span>
         </div>
       </aside>
@@ -215,6 +216,15 @@ function printCut(): void {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+}
+.step-row .g-cut {
+  flex: none;
+  font-size: 10px;
+  font-weight: 700;
+  color: #7c3aed;
+  border: 1px solid #c4b5fd;
+  border-radius: 999px;
+  padding: 0 5px;
 }
 .step-row .t {
   font-size: 12px;

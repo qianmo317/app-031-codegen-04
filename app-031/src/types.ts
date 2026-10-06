@@ -42,6 +42,10 @@ export interface Placement {
   origWid: number
   rotated: boolean
   seq: number
+  grainGroupId?: string
+  grainGroupCode?: string
+  grainSegmentCode?: string
+  grainOrder?: number
   // 冗余展示字段
   code: string
   name: string
@@ -60,6 +64,7 @@ export interface CutStep {
   order: number
   kind: 'trim' | 'cut'
   label: string
+  grainSegmentCodes?: string[]
 }
 
 export interface OffcutInfo {
@@ -69,6 +74,111 @@ export interface OffcutInfo {
   hMm: number
   areaMm2: number
   usable: boolean // 两边 ≥300mm 才登记为可用余料，其余仅作碎料留档
+}
+
+export interface GrainGroupMember {
+  partId: string
+  qty: number // 该零件有几件绑入本组；未用完的数量仍为零散件
+}
+
+export interface GrainGroup {
+  id: string
+  name: string
+  members: GrainGroupMember[]
+  splitPolicy: 'move' | 'split' // 当前板/新板放不下时：整组挪板，或按 splitAfter 让步拆段
+  splitAfter?: number // 在第 N 件后断开；1..件数-1，空/非法时默认约半数
+}
+
+export type GrainGroupPriority = 'longFirst' | 'shortFirst'
+
+export interface GrainBreak {
+  groupId: string
+  groupCode: string
+  afterOrder: number // 从第 1 件数起，断在此件之后
+  beforeInstanceId: string
+  beforeCode: string
+  afterCode: string
+  boardIndex: number // 后半段所在板；前半段在 boardIndex-1
+  boardNo: number
+  axis: 'x' | 'y' // 拼接轴向（横拼/竖拼）
+  atMm: number // 断口坐标（mm，整数展示）
+  reason: 'fallback' | 'boardCapacity'
+}
+
+export interface GrainSegmentInfo {
+  code: string // 未拆 G01；拆开 G01-A / G01-B
+  groupId: string
+  boardIndex: number
+  boardNo: number
+  startOrder: number
+  endOrder: number
+  instanceIds: string[]
+  partCodes: string[]
+  chainLengthMm: number // 净连纹长度（不含锯路，mm，向下游统一取整）
+  areaMm2: number // 组内净面积（不含锯路，mm²，整数）
+  axis: 'x' | 'y'
+  split: boolean
+}
+
+export interface GrainGroupResult {
+  id: string
+  code: string
+  name: string
+  memberCount: number
+  netChainLengthMm: number // 未被拆开的完整连纹长度；已拆时为最长一段
+  totalAreaMm2: number
+  status: 'complete' | 'split' | 'unplaced' | 'invalid'
+  segments: GrainSegmentInfo[]
+  breaks: GrainBreak[]
+  connectedOrders: number[][] // 每一小段的组内顺序；如 [[1,2],[3,4]]
+  note: string
+}
+
+export interface GrainChange {
+  type: 'groupChanged' | 'breakMoved' | 'sheetChanged' | 'cutChanged' | 'orderChanged'
+  groupCode: string
+  detail: string
+  instanceIds: string[]
+  items: {
+    instanceId: string
+    code: string
+    order: number | null
+    before: string
+    after: string
+  }[]
+  affectedBoardNos: number[]
+  previewRows: string[]
+  cutRows: string[]
+  orderRows: string[]
+}
+
+export interface GrainNestSummary {
+  version: number
+  strategy: GrainGroupPriority
+  tradeoff: string
+  unit: {
+    length: 'mm'
+    lengthRounding: '整数（四舍五入）'
+    area: 'mm²'
+    areaRounding: '整数（四舍五入）'
+  }
+  groups: GrainGroupResult[]
+  changes: GrainChange[]
+  supersededRevision?: number
+  issuedRevisions: number[]
+  inputSignature: string
+}
+
+export interface NestRevisionArchive {
+  version: number
+  inputSignature: string
+  status: 'active' | 'superseded' | 'voided'
+  issued: boolean
+  issuedAt?: number
+  voidedAt?: number
+  voidReason?: string
+  sheets: { boardNo: number; boardName: string; groupCodes: string[] }[]
+  resultSnapshot?: NestResult
 }
 
 export interface SheetResult {
@@ -86,6 +196,7 @@ export interface SheetResult {
   boardAreaMm2: number
   utilization: number
   offcuts: OffcutInfo[]
+  grainSegments: GrainSegmentInfo[]
   adjusted?: boolean
 }
 
@@ -108,6 +219,7 @@ export interface NestResult {
   savedCents: number
   totalCostCents: number
   stockShortage: { boardId: string; boardName: string; need: number; have: number }[]
+  grain: GrainNestSummary
   elapsedMs: number
   generatedAt: number
 }
@@ -122,6 +234,9 @@ export interface Job {
   trimMm: number
   useOffcutIds: string[] // 参与本单排样的登记余料
   batchByCabinet: boolean // 按柜体批次分组开料
+  grainGroups: GrainGroup[]
+  grainPriority: GrainGroupPriority
+  grainRevisions: NestRevisionArchive[]
   result?: NestResult
 }
 

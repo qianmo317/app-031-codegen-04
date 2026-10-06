@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
+import { grainInputSignature } from '../lib/packing'
 import { pct, money } from '../lib/format'
 import SheetDiagram from '../components/SheetDiagram.vue'
 import { cabinetFill, cabinetStroke } from '../lib/colors'
@@ -23,6 +24,10 @@ const overallUtil = computed(() => {
   const total = result.value.sheets.reduce((a, s) => a + s.boardAreaMm2, 0)
   return total > 0 ? used / total : 0
 })
+const resultStale = computed(
+  () => !!job.value?.result && job.value.result.grain.inputSignature !== grainInputSignature(job.value)
+)
+
 const cabinets = computed(() => {
   const set = new Set<string>()
   result.value?.sheets.forEach((s) => s.placements.forEach((p) => set.add(p.cabinet)))
@@ -66,6 +71,17 @@ function registerAll(): void {
 
 function rerun(): void {
   if (!job.value) return
+  const r = job.value.result
+  if (
+    r &&
+    r.grain.inputSignature !== grainInputSignature(job.value) &&
+    r.grain.issuedRevisions.includes(r.grain.version) &&
+    !window.confirm(
+      `V${r.grain.version} 的领料/下料单已经发出。重排会作废旧分组、旧拼版图和已发单据。确定继续吗？`
+    )
+  ) {
+    return
+  }
   runNest(job.value)
   activeSheet.value = 0
   toast('已重新排样', 'good')
@@ -155,6 +171,9 @@ function printNest(): void {
       <router-link class="sm btn-like" :to="`/cut/${job.id}`">看裁切步骤 →</router-link>
     </section>
 
+    <div v-if="resultStale" class="alert warn">
+      当前预览是旧版排样：连纹组、件数/顺序或取舍策略已改动，尚未重新排样。点「重新排样」后受影响板会整张重排。
+    </div>
     <div v-if="result.unplaced.length > 0" class="alert bad">
       <b>{{ result.unplaced.reduce((a, u) => a + u.qty, 0) }} 件未排下：</b>
       <span v-for="u in result.unplaced" :key="u.partId" class="alert-item">
@@ -164,6 +183,86 @@ function printNest(): void {
     <div v-for="sh in result.stockShortage" :key="sh.boardId" class="alert warn">
       库存不足：{{ sh.boardName }} 需要 {{ sh.need }} 张，库存仅 {{ sh.have }} 张，请补采 {{ sh.need - sh.have }} 张。
     </div>
+
+    <section class="panel grain-summary">
+      <div class="row wrap">
+        <h3 style="font-size: 14px">成组连纹 · 第 {{ result.grain.version }} 版</h3>
+        <span class="tag" :class="result.grain.strategy === 'longFirst' ? 'good' : 'warn'">
+          {{ result.grain.strategy === 'longFirst' ? '先排长组 · 保连纹' : '先排短组 · 省板' }}
+        </span>
+        <span class="small muted">{{ result.grain.tradeoff }}</span>
+        <div class="spacer" />
+        <span class="small muted">长度：毫米 mm，四舍五入整数（净连纹长度，不含锯路）；面积：平方毫米 mm²，四舍五入整数（零件净面积，不含锯路）</span>
+      </div>
+      <div v-if="result.grain.issuedRevisions.includes(result.grain.version)" class="tag good">本版领料/下料单已发出并存本机存档</div>
+      <div v-if="result.grain.supersededRevision" class="tag warn">上一版（V{{ result.grain.supersededRevision }}）已作废，旧拼版图和已发单据不得继续使用</div>
+      <table v-if="result.grain.groups.length" class="grid grain-table">
+        <thead>
+          <tr>
+            <th>组号</th><th>组名</th><th>件数</th><th>状态</th><th>本版连纹长度(mm)</th><th>面积(mm²)</th><th>仍连得上的件</th><th>断口位置</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="g in result.grain.groups" :key="g.id">
+            <td><b>{{ g.code }}</b></td>
+            <td>{{ g.name }}</td>
+            <td>{{ g.memberCount }}</td>
+            <td>
+              <span class="tag" :class="g.status === 'complete' ? 'good' : g.status === 'invalid' ? 'bad' : 'warn'">
+                {{ g.status === 'complete' ? '完整' : g.status === 'split' ? '已拆段' : g.status === 'unplaced' ? '未排下' : '配置无效' }}
+              </span>
+            </td>
+            <td>{{ g.netChainLengthMm }}</td>
+            <td>{{ g.totalAreaMm2 }}</td>
+            <td>
+              <span v-if="g.connectedOrders.length === 0">—</span>
+              <span v-for="(seg, i) in g.connectedOrders" :key="i" class="conn-chip">
+                第 {{ seg[0] }}-{{ seg[seg.length - 1] }} 件连续
+              </span>
+            </td>
+            <td>
+              <span v-if="g.breaks.length === 0">无断口</span>
+              <div v-for="br in g.breaks" :key="br.beforeInstanceId">
+                断在 {{ br.afterOrder }} 号前：{{ br.beforeCode }} → {{ br.afterCode }}；
+                后半段在第 {{ br.boardNo }} 张板，{{ br.axis === 'x' ? `X=${br.atMm}mm` : `Y=${br.atMm}mm` }}
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="result.grain.changes.length" class="change-box">
+        <b>组内件数/顺序改动已触发整张重排：</b>
+        <ul>
+          <li v-for="(c, i) in result.grain.changes" :key="i">
+            {{ c.groupCode }}：{{ c.detail }}
+            <ul>
+              <li v-for="row in c.previewRows" :key="row">预览图：{{ row }}</li>
+              <li v-for="row in c.cutRows" :key="row">工单：{{ row }}</li>
+              <li v-for="row in c.orderRows" :key="row">单据：{{ row }}</li>
+            </ul>
+          </li>
+        </ul>
+      </div>
+      <details v-if="job.grainRevisions.length > 1" class="revision-box">
+        <summary>本机版次/作废存档（{{ job.grainRevisions.length }} 版）</summary>
+        <table class="grid">
+          <thead><tr><th>版次</th><th>状态</th><th>已发单据</th><th>拼版图存档</th><th>作废原因</th></tr></thead>
+          <tbody>
+            <tr v-for="r in [...job.grainRevisions].reverse()" :key="r.version">
+              <td>V{{ r.version }}</td>
+              <td>{{ r.status === 'active' ? '当前有效' : r.status === 'voided' ? '已作废' : '已被替代' }}</td>
+              <td>{{ r.issued ? '已导出/打印' : '未发出' }}</td>
+              <td>
+                <span v-for="sh in r.sheets" :key="sh.boardNo" class="rev-sheet">
+                  板{{ sh.boardNo }} {{ sh.groupCodes.join('/') || '无组' }}
+                </span>
+              </td>
+              <td>{{ r.voidReason || '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </details>
+    </section>
 
     <div class="layout">
       <!-- 左：板标签 -->
@@ -229,7 +328,7 @@ function printNest(): void {
             :class="{ sel: selectedId === p.instanceId }"
             @click="selectedId = p.instanceId"
           >
-            <b>{{ p.seq }}. {{ p.code }}</b>
+            <b>{{ p.seq }}. {{ p.code }} <em v-if="p.grainSegmentCode" class="g-chip">{{ p.grainSegmentCode }}#{{ p.grainOrder }}</em></b>
             <span>{{ p.origLen }}×{{ p.origWid }} · {{ p.cabinet }}</span>
           </div>
         </div>
@@ -318,6 +417,50 @@ function printNest(): void {
 .alert-item {
   margin-right: 14px;
   white-space: nowrap;
+}
+.grain-summary {
+  margin-bottom: 12px;
+}
+.grain-table {
+  margin-top: 9px;
+  font-size: 12px;
+}
+.conn-chip {
+  display: inline-block;
+  margin: 1px 4px 1px 0;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #f0faf8;
+  color: var(--c-accent);
+  border: 1px solid #b7ddd7;
+}
+.change-box {
+  margin-top: 9px;
+  padding: 8px 10px;
+  border: 1px solid #f0d9b5;
+  background: #fffbeb;
+  color: #92600a;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.revision-box {
+  margin-top: 9px;
+  font-size: 12px;
+}
+.rev-sheet {
+  display: inline-block;
+  margin: 1px 4px 1px 0;
+  padding: 1px 5px;
+  border: 1px solid var(--c-line-soft);
+  border-radius: 4px;
+}
+.g-chip {
+  font-style: normal;
+  font-size: 10px;
+  color: #7c3aed;
+  border: 1px solid #c4b5fd;
+  border-radius: 999px;
+  padding: 0 5px;
 }
 .layout {
   display: grid;

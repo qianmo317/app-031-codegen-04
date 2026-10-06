@@ -50,6 +50,9 @@ const cabinetGroups = computed(() => {
 const grainText = (g: string): string =>
   g === 'length' ? '竖纹' : g === 'width' ? '横纹' : '无要求'
 
+const grainGroups = computed(() => job.value?.result?.grain.groups ?? [])
+const grainRevisions = computed(() => job.value?.grainRevisions ?? [])
+
 const boardByName = (name: string) =>
   job.value?.result?.sheets.find((x) => x.boardName === name)
 </script>
@@ -67,7 +70,8 @@ const boardByName = (name: string) =>
         <p class="doc-meta">
           {{ s.boardName }}（{{ s.material }} {{ s.thicknessMm }}mm） · 尺寸
           {{ s.wMm }}×{{ s.hMm }}mm · 利用率 {{ (s.utilization * 100).toFixed(1) }}% ·
-          锯路 {{ job.kerfMm }}mm · 修边 {{ job.trimMm }}mm
+          锯路 {{ job.kerfMm }}mm · 修边 {{ job.trimMm }}mm ·
+          连纹组 {{ s.grainSegments.map((x) => x.code).join('、') || '无' }}
         </p>
         <div class="print-sheet-wrap">
           <SheetDiagram :sheet="s" :show-cuts="false" print-mode />
@@ -75,13 +79,14 @@ const boardByName = (name: string) =>
         <table class="pgrid">
           <thead>
             <tr>
-              <th>序号</th><th>编号</th><th>名称</th><th>柜体</th>
+              <th>序号</th><th>组号/顺序</th><th>编号</th><th>名称</th><th>柜体</th>
               <th>尺寸(mm)</th><th>纹理</th><th>封边</th><th>见光</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="p in s.placements" :key="p.instanceId">
               <td>{{ p.seq }}</td>
+              <td>{{ p.grainSegmentCode || p.grainGroupCode || '—' }}<template v-if="p.grainOrder">#{{ p.grainOrder }}</template></td>
               <td>{{ p.code }}</td>
               <td>{{ p.name }}</td>
               <td>{{ p.cabinet }}</td>
@@ -103,14 +108,15 @@ const boardByName = (name: string) =>
         class="print-page"
       >
         <h2>裁切步骤表 · 第 {{ s.index + 1 }} 张（{{ s.boardName }}）</h2>
-        <p class="doc-meta">按顺序下锯；同向刀已连续排程（减少推台翻转）；修边刀可多板叠切。</p>
+        <p class="doc-meta">按顺序下锯；同向刀已连续排程（减少推台翻转）；修边刀可多板叠切。本板连纹组：{{ s.grainSegments.map((x) => x.code).join('、') || '无' }}</p>
         <table class="pgrid">
           <thead>
-            <tr><th>刀序</th><th>类型</th><th>方向</th><th>位置(mm)</th><th>贯通区间(mm)</th><th>说明</th></tr>
+            <tr><th>刀序</th><th>连纹组</th><th>类型</th><th>方向</th><th>位置(mm)</th><th>贯通区间(mm)</th><th>说明</th></tr>
           </thead>
           <tbody>
             <tr v-for="st in s.steps" :key="st.order">
               <td>{{ st.order + 1 }}</td>
+              <td>{{ st.grainSegmentCodes?.join('/') || '—' }}</td>
               <td>{{ st.kind === 'trim' ? '修边' : '裁切' }}</td>
               <td>{{ st.axis === 'v' ? '竖刀' : '横刀' }}</td>
               <td>{{ Math.round(st.at) }}</td>
@@ -172,7 +178,55 @@ const boardByName = (name: string) =>
           </table>
         </div>
 
-        <h3>三、封边与五金辅料</h3>
+        <h3>三、成组连纹与断口（组号/板号与排样图、裁切表一致）</h3>
+        <p class="doc-meta">长度单位 mm，四舍五入整数（净连纹长度，不含锯路）；面积单位 mm²，四舍五入整数（零件净面积，不含锯路）。当前版次 V{{ job.result?.grain.version }}。</p>
+        <table class="pgrid">
+          <thead>
+            <tr><th>组号</th><th>组名</th><th>件数</th><th>状态</th><th>连纹长度(mm)</th><th>面积(mm²)</th><th>仍连续</th><th>断口位置</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="g in grainGroups" :key="g.id">
+              <td>{{ g.code }}</td>
+              <td>{{ g.name }}</td>
+              <td>{{ g.memberCount }}</td>
+              <td>{{ g.status === 'complete' ? '完整' : g.status === 'split' ? '拆段' : g.status === 'unplaced' ? '未排下' : '无效' }}</td>
+              <td>{{ g.netChainLengthMm }}</td>
+              <td>{{ g.totalAreaMm2 }}</td>
+              <td>{{ g.connectedOrders.map((s) => `第${s[0]}-${s[s.length - 1]}件`).join('；') || '—' }}</td>
+              <td>
+                <span v-if="g.breaks.length === 0">无断口</span>
+                <span v-for="br in g.breaks" :key="br.beforeInstanceId">
+                  第{{ br.afterOrder }}件前；后半段板{{ br.boardNo }}；{{ br.axis === 'x' ? 'X' : 'Y' }}={{ br.atMm }}mm
+                </span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <table v-if="grainRevisions.length" class="pgrid" style="margin-top: 6px">
+          <thead><tr><th>版次</th><th>状态</th><th>已发单据</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr v-for="r in [...grainRevisions].reverse()" :key="r.version">
+              <td>V{{ r.version }}</td>
+              <td>{{ r.status === 'active' ? '当前有效' : r.status === 'voided' ? '已作废' : '已被替代' }}</td>
+              <td>{{ r.issued ? `已发 ${r.issuedAt ? new Date(r.issuedAt).toLocaleString('zh-CN') : ''}` : '未发' }}</td>
+              <td>{{ r.voidReason || '本机存档' }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <table v-if="job.result?.grain.changes.length" class="pgrid" style="margin-top: 6px">
+          <thead><tr><th>改动组</th><th>改动说明</th><th>预览图变更行</th><th>裁切工单变更行</th><th>领料单据变更行</th></tr></thead>
+          <tbody>
+            <tr v-for="(c, i) in job.result.grain.changes" :key="i">
+              <td>{{ c.groupCode }}</td>
+              <td>{{ c.detail }}</td>
+              <td>{{ c.previewRows.join('；') }}</td>
+              <td>{{ c.cutRows.join('；') }}</td>
+              <td>{{ c.orderRows.join('；') }}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>四、封边与五金辅料</h3>
         <table class="pgrid">
           <tbody>
             <tr><td>见光边封边</td><td>{{ job.result?.edgeBandM.exposed }} m</td></tr>
@@ -200,7 +254,7 @@ const boardByName = (name: string) =>
           <div class="lb-code">{{ p.code }} <span class="lb-seq">#{{ p.seq }}</span></div>
           <div class="lb-name">{{ p.name }}</div>
           <div class="lb-dims">{{ mm(p.origLen) }} × {{ mm(p.origWid) }} mm</div>
-          <div class="lb-meta">{{ p.cabinet }} ｜ {{ grainText(p.grain) }} ｜ 封边 {{ p.edgeBands.length }} 边{{ p.exposed ? ' ｜ 见光' : '' }}</div>
+          <div class="lb-meta">{{ p.cabinet }} ｜ {{ grainText(p.grain) }} ｜ {{ p.grainSegmentCode || p.grainGroupCode ? `连纹 ${p.grainSegmentCode || p.grainGroupCode}#${p.grainOrder} ｜ ` : '' }}封边 {{ p.edgeBands.length }} 边{{ p.exposed ? ' ｜ 见光' : '' }}</div>
         </div>
       </section>
     </div>

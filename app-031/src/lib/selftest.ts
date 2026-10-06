@@ -59,7 +59,8 @@ function makePart(over: Partial<Part> = {}): Part {
     edgeBands: over.edgeBands ?? [],
     cabinet: over.cabinet ?? '柜A',
     exposed: over.exposed ?? false,
-    boardId: over.boardId ?? ''
+    boardId: over.boardId ?? '',
+    ...over
   }
 }
 
@@ -74,6 +75,9 @@ function makeJob(parts: Part[], over: Partial<Job> = {}): Job {
     trimMm: over.trimMm ?? 8,
     useOffcutIds: [],
     batchByCabinet: false,
+    grainGroups: over.grainGroups ?? [],
+    grainPriority: over.grainPriority ?? 'longFirst',
+    grainRevisions: over.grainRevisions ?? [],
     ...over
   }
 }
@@ -438,6 +442,111 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 成组连纹：同板、同向、首尾相接，超过板幅按指定第 N 件拆成两小段
+  {
+    const door = makePart({ id: 'door', code: 'DR', name: '衣柜门板', lenMm: 2180, widMm: 446, qty: 4, grain: 'length' })
+    const loose = makePart({ id: 'loose', code: 'LS', name: '零散件', lenMm: 600, widMm: 500, qty: 4 })
+    const job = makeJob([door, loose], {
+      grainGroups: [
+        {
+          id: 'g-door',
+          name: '衣柜并排门板',
+          members: [{ partId: 'door', qty: 4 }],
+          splitPolicy: 'split',
+          splitAfter: 2
+        }
+      ]
+    })
+    const r = nestJob(job)
+    job.result = r
+    const g = r.grain.groups[0]
+    const segPls = r.sheets.flatMap((s) => s.placements).filter((p) => p.partId === 'door')
+    const segmentSheet = r.sheets.find((s) => s.placements.some((p) => p.grainSegmentCode === 'G01-A'))!
+    const sheet0Doors = segmentSheet.placements.filter((p) => p.partId === 'door')
+    const orderedY = [...sheet0Doors].sort((a, b) => a.y - b.y)
+    const adjacent = Math.abs(orderedY[1].y - (orderedY[0].y + orderedY[0].widMm) - job.kerfMm) < 0.1
+    const noInsert = segmentSheet.placements.length === 2
+    const simsOk = r.sheets.every((s) => simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements).ok)
+    const codes = g.segments.map((x) => x.code).join('/')
+    const ok =
+      g.status === 'split' &&
+      codes === 'G01-A/G01-B' &&
+      g.segments[0].boardNo === 1 &&
+      g.segments[1].boardNo === 2 &&
+      g.netChainLengthMm === 892 &&
+      g.totalAreaMm2 === 4 * 2180 * 446 &&
+      g.breaks.length === 1 &&
+      g.breaks[0].afterOrder === 2 &&
+      adjacent &&
+      noInsert &&
+      segPls.every((p) => !p.rotated) &&
+      simsOk
+    add(
+      '成组连纹同板同向且只按让步点拆段，条内不插别家件',
+      ok,
+      ok
+        ? `${codes}：各 892mm，断在第2件后/第3件前；4件均未旋转，切割模拟通过`
+        : `状态 ${g.status}，段 ${codes}，相邻 ${adjacent}，模拟 ${simsOk}`
+    )
+  }
+
+  // 11) 单件组与无绑定件不出断口
+  {
+    const one = makePart({ code: 'ONE', lenMm: 700, widMm: 300, qty: 1, grain: 'length' })
+    const loose = makePart({ code: 'FREE', lenMm: 600, widMm: 500, qty: 2 })
+    const job = makeJob([one, loose], {
+      grainGroups: [{ id: 'g-one', name: '单件组', members: [{ partId: one.id, qty: 1 }], splitPolicy: 'move' }]
+    })
+    const r = nestJob(job)
+    const g = r.grain.groups[0]
+    const pl = r.sheets.flatMap((s) => s.placements).find((p) => p.code === 'ONE')
+    const ok = g.status === 'complete' && g.breaks.length === 0 && !!pl?.grainGroupCode && g.netChainLengthMm === 300
+    add('单件组保留组号但不制造断口', ok, ok ? 'G01 单件随普通件填缝，无断口' : '单件组出现异常断口')
+  }
+
+  // 12) 三处共用同一份组号/板号/断口，且裁切步骤带同组标记
+  {
+    const door = makePart({ code: 'GRP', lenMm: 2180, widMm: 446, qty: 4, grain: 'length' })
+    const job = makeJob([door], {
+      grainGroups: [
+        { id: 'g', name: 'G', members: [{ partId: door.id, qty: 4 }], splitPolicy: 'split', splitAfter: 2 }
+      ]
+    })
+    const r = nestJob(job)
+    const sheetCodes = r.sheets.map((s) => s.grainSegments.map((x) => x.code).join('/')).filter(Boolean)
+    const labeledSteps = r.sheets.flatMap((s) => s.steps).filter((st) => st.grainSegmentCodes?.includes('G01-A'))
+    const group = r.grain.groups[0]
+    const ok =
+      sheetCodes[0] === 'G01-A' &&
+      sheetCodes[1] === 'G01-B' &&
+      labeledSteps.length > 0 &&
+      group.breaks[0].boardNo === 2 &&
+      group.segments.every((seg) => r.sheets[seg.boardIndex].grainSegments.includes(seg))
+    add(
+      '排样图、裁切步骤、结果组表共用同一组号/板号/断口',
+      ok,
+      ok ? `预览 ${sheetCodes.join('、')}；G01-A 标记刀序 ${labeledSteps.length} 条` : '三处组号或板号不一致'
+    )
+  }
+
+  // 13) 无效连纹配置明确报错，不偷偷改纹理朝向
+  {
+    const a = makePart({ id: 'a', code: 'A', lenMm: 700, widMm: 300, qty: 1, grain: 'length' })
+    const b = makePart({ id: 'b', code: 'B', lenMm: 300, widMm: 700, qty: 1, grain: 'width' })
+    const job = makeJob([a, b], {
+      grainGroups: [
+        { id: 'bad', name: '混纹组', members: [{ partId: 'a', qty: 1 }, { partId: 'b', qty: 1 }], splitPolicy: 'move' }
+      ]
+    })
+    const r = nestJob(job)
+    const ok = r.grain.groups[0].status === 'invalid' && r.unplaced.length === 0
+    add(
+      '混纹/无纹组走统一配置校验且不另开门板旋转分支',
+      ok,
+      ok ? r.grain.groups[0].note : '无效组被错误排样'
     )
   }
 
