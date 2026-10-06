@@ -16,3 +16,17 @@ export function cabinetFill(name: string): string {
 export function cabinetStroke(name: string): string {
   return `hsl(${cabinetHue(name)} 42% 52%)`
 }
+
+// 连纹组号 → 稳定配色（组号是三处出口共用的同一份编号）
+export function groupHue(no: number): number {
+  return palette[(no - 1) % palette.length]
+}
+
+export function groupHueColor(no: number): { stroke: string; fill: string; text: string } {
+  const h = groupHue(no)
+  return {
+    stroke: `hsl(${h} 64% 42%)`,
+    fill: `hsl(${h} 70% 94%)`,
+    text: `hsl(${h} 70% 30%)`
+  }
+}

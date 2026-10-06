@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import { getJob, runNest, applyAdjustment, registerOffcuts, useStore, clearGrainVoid } from '../lib/store'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
 import { pct, money } from '../lib/format'
 import SheetDiagram from '../components/SheetDiagram.vue'
-import { cabinetFill, cabinetStroke } from '../lib/colors'
+import { cabinetFill, cabinetStroke, groupHueColor } from '../lib/colors'
+import type { GrainGroupResult } from '../types'
 
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
@@ -16,6 +17,29 @@ const activeSheet = ref(0)
 const sheet = computed(() => result.value?.sheets[activeSheet.value])
 const adjustMode = ref(false)
 const selectedId = ref<string | null>(null)
+
+// 本张板上的连纹段（组号-段号与工单/单据同一份）
+const sheetStrips = computed(() => {
+  if (!result.value) return []
+  const groups = result.value.grainGroups
+  const out: { g: GrainGroupResult; seg: GrainGroupResult['segments'][number] }[] = []
+  for (const g of groups) {
+    for (const seg of g.segments) {
+      if (seg.boardIndex === activeSheet.value) out.push({ g, seg })
+    }
+  }
+  return out.sort((a, b) => a.g.no - b.g.no || a.seg.segmentNo - b.seg.segmentNo)
+})
+const boardBreakCount = computed(() => {
+  const n = new Map<number, number>()
+  for (const g of result.value?.grainGroups ?? []) {
+    for (const bk of g.breaks) {
+      n.set(bk.beforeBoardIndex, (n.get(bk.beforeBoardIndex) ?? 0) + 1)
+      n.set(bk.afterBoardIndex, (n.get(bk.afterBoardIndex) ?? 0) + 1)
+    }
+  }
+  return n
+})
 
 const overallUtil = computed(() => {
   if (!result.value || result.value.sheets.length === 0) return 0
@@ -165,6 +189,72 @@ function printNest(): void {
       库存不足：{{ sh.boardName }} 需要 {{ sh.need }} 张，库存仅 {{ sh.have }} 张，请补采 {{ sh.need - sh.have }} 张。
     </div>
 
+    <!-- 旧版领料单/拼版图作废提示 -->
+    <div v-if="job.grainVoid" class="alert void">
+      <b>⚠ 上一版已作废：</b>{{ job.grainVoid.reason }}
+      旧版签发于 {{ new Date(job.grainVoid.issuedAt).toLocaleString('zh-CN') }}。
+      <button class="sm" @click="clearGrainVoid(job!)">我已知悉，按本版重领</button>
+    </div>
+
+    <!-- 成组连纹汇总 -->
+    <section v-if="result.grainGroups.length > 0" class="panel grain-summary">
+      <div class="row">
+        <h3 style="font-size: 14px">成组连纹（{{ result.grainGroups.length }} 组）</h3>
+        <span class="tag">
+          取舍：{{ result.grainPolicy === 'short-first' ? '先排短组·省板优先' : '先排长组·连纹优先' }}
+        </span>
+        <span class="muted small">长度 mm 取整，面积 mm² 取整</span>
+        <div class="spacer" />
+      </div>
+      <p class="small muted" style="margin: 2px 0 8px">
+        组号 G…、板号、断口位置在预览图、裁切工单、导出单据三处为同一份；同一段内的门纹理首尾相接，断口处接不上。
+      </p>
+      <div v-for="g in result.grainGroups" :key="g.id" class="gline" :style="{ borderLeftColor: groupHueColor(g.no).stroke }">
+        <div class="row" style="gap: 8px">
+          <b class="gno" :style="{ background: groupHueColor(g.no).stroke }">G{{ g.no }}</b>
+          <b>{{ g.name }}</b>
+          <span class="tag">{{ g.memberCount }} 扇 / {{ g.segmentCount }} 段</span>
+          <span class="tag" :class="g.breaks.length ? 'bad' : 'good'">
+            {{ g.breaks.length === 0 ? '整条连纹无断口' : `${g.breaks.length} 处断口` }}
+          </span>
+        </div>
+        <div class="seg-chain">
+          <template v-for="(seg, si) in g.segments" :key="seg.id">
+            <button class="seg-pill" @click="activeSheet = seg.boardIndex" :title="'第 ' + (seg.boardIndex + 1) + ' 张板'">
+              <span>第{{ seg.boardIndex + 1 }}板 · 第{{ seg.segmentNo }}段</span>
+              <b>{{ seg.lengthMm }}mm</b>
+              <span class="muted">{{ seg.areaMm2.toLocaleString() }}mm² · {{ seg.memberCodes.join('、') }}</span>
+            </button>
+            <span v-if="g.breaks[si]" class="break-mark">
+              ✂ 断口：{{ g.breaks[si].beforeCode }} → {{ g.breaks[si].afterCode }}
+              （第{{ g.breaks[si].beforeBoardIndex + 1 }}板 → 第{{ g.breaks[si].afterBoardIndex + 1 }}板，
+              {{ g.breaks[si].reason === 'forced' ? '单板放不下被迫断' : '按让步顺序拆段' }}）
+            </span>
+          </template>
+        </div>
+      </div>
+    </section>
+
+    <!-- 分组/断口/单据行变化（组内件数或顺序改一次就整张重排） -->
+    <section v-if="result.grainDiff" class="panel grain-diff">
+      <details open>
+        <summary><b>本次重排变化（组号/断口/受影响板与单据行）</b></summary>
+        <div v-if="result.grainDiff.affectedBoards.length > 0" class="small" style="margin-top:6px">
+          需整张重排并重出单据的板：
+          <b v-for="b in result.grainDiff.affectedBoards" :key="b" class="board-badge">第 {{ b + 1 }} 张</b>
+        </div>
+        <ul class="small diff-list">
+          <li v-for="(row, i) in result.grainDiff.changedDocRows" :key="i">{{ row }}</li>
+        </ul>
+        <div v-if="result.grainDiff.instanceChanges.length === 0 && result.grainDiff.breakChanges.length === 0" class="small muted">
+          分组与断口无变化。
+        </div>
+      </details>
+    </section>
+
+    <!-- 分组警告 -->
+    <div v-for="(w, i) in result.grainWarnings" :key="'w' + i" class="alert warn">{{ w }}</div>
+
     <div class="layout">
       <!-- 左：板标签 -->
       <aside class="sheet-tabs no-print">
@@ -187,6 +277,12 @@ function printNest(): void {
           <b>第 {{ activeSheet + 1 }} 张 / 共 {{ result.sheets.length }} 张</b>
           <span class="tag">{{ sheet?.boardName }}</span>
           <span class="tag good">利用率 {{ pct(sheet?.utilization ?? 0) }}</span>
+          <span v-if="(boardBreakCount.get(sheet?.index ?? -1) ?? 0) > 0" class="tag bad">
+            ✂ {{ boardBreakCount.get(sheet!.index) }} 处连纹断口
+          </span>
+          <span v-for="st in sheetStrips" :key="st.seg.id" class="tag grain-tag">
+            G{{ st.g.no }}-{{ st.seg.segmentNo }} 连纹 {{ st.seg.lengthMm }}mm
+          </span>
           <span v-if="sheet?.adjusted" class="tag warn">已手工微调</span>
           <div class="spacer" />
           <label class="row small" style="gap:4px">
@@ -220,6 +316,13 @@ function printNest(): void {
 
       <!-- 右：零件/余料明细 -->
       <aside class="side panel no-print">
+        <h4 v-if="sheetStrips.length > 0">本板连纹段（{{ sheetStrips.length }}）</h4>
+        <div v-for="st in sheetStrips" :key="st.seg.id" class="strip-row" :style="{ borderLeftColor: groupHueColor(st.g.no).stroke }">
+          <b>G{{ st.g.no }}-{{ st.seg.segmentNo }}</b>
+          <span class="small">{{ st.seg.lengthMm }}mm 连纹 · {{ st.seg.areaMm2.toLocaleString() }}mm²</span>
+          <span class="small muted">沿纹理：{{ st.seg.memberCodes.join(' → ') }}</span>
+        </div>
+
         <h4>本板零件（{{ sheet?.placements.length }}）</h4>
         <div class="mini-list">
           <div
@@ -230,7 +333,7 @@ function printNest(): void {
             @click="selectedId = p.instanceId"
           >
             <b>{{ p.seq }}. {{ p.code }}</b>
-            <span>{{ p.origLen }}×{{ p.origWid }} · {{ p.cabinet }}</span>
+            <span>{{ p.origLen }}×{{ p.origWid }} · {{ p.cabinet }}<template v-if="p.grainGroupNo"> · G{{ p.grainGroupNo }}-{{ p.grainSegmentNo }}#{{ p.grainOrdinal }}</template></span>
           </div>
         </div>
         <h4 style="margin-top: 12px">可用余料</h4>
@@ -258,6 +361,10 @@ function printNest(): void {
             位置 ({{ Math.round(selected.x) }}, {{ Math.round(selected.y) }})<br />
             {{ selected.cabinet }} · {{ selected.grain === 'length' ? '竖纹' : selected.grain === 'width' ? '横纹' : '纹理无要求' }}
             · 封边 {{ selected.edgeBands.length }} 边{{ selected.exposed ? ' · 见光' : '' }}
+          </p>
+          <p v-if="selected.grainGroupNo" class="small" style="color:#92400e">
+            连纹组 G{{ selected.grainGroupNo }} 第 {{ selected.grainSegmentNo }} 段，组内第 {{ selected.grainOrdinal }} 扇，
+            沿纹理与相邻门板首尾相接。
           </p>
         </div>
       </aside>
@@ -314,6 +421,84 @@ function printNest(): void {
   background: #fffbeb;
   border: 1px solid #f0d9b5;
   color: #92600a;
+}
+.alert.void {
+  background: #fef2f2;
+  border: 1px solid #dc2626;
+  color: #991b1b;
+}
+.grain-summary .gline {
+  border-left: 4px solid #b45309;
+  padding: 6px 10px;
+  margin: 8px 0;
+  background: #fffdf8;
+  border-radius: 0 6px 6px 0;
+}
+.grain-summary .gno {
+  color: #fff;
+  border-radius: 5px;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+.seg-chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+}
+.seg-pill {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  border: 1px solid #d6a55e;
+  background: #fffaf0;
+  border-radius: 6px;
+  padding: 4px 9px;
+  cursor: pointer;
+  text-align: left;
+}
+.seg-pill b {
+  font-size: 14px;
+  color: #92400e;
+}
+.break-mark {
+  color: #b91c1c;
+  font-size: 12px;
+  font-weight: 600;
+}
+.grain-diff {
+  background: #f8faf9;
+}
+.grain-diff summary {
+  cursor: pointer;
+}
+.diff-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+.board-badge {
+  margin: 0 4px;
+  padding: 0 6px;
+  background: #fee2e2;
+  border-radius: 4px;
+  color: #991b1b;
+}
+.grain-tag {
+  background: #fff7ed;
+  border-color: #d6a55e;
+  color: #92400e;
+}
+.strip-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  border-left: 4px solid #b45309;
+  background: #fffaf0;
+  border-radius: 0 5px 5px 0;
+  padding: 5px 8px;
+  margin-bottom: 6px;
 }
 .alert-item {
   margin-right: 14px;

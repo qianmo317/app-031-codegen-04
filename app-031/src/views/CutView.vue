@@ -98,17 +98,22 @@ function printCut(): void {
 
     <div class="cut-layout">
       <section class="panel">
-        <div class="cut-headline" :class="{ trim: currentStep?.kind === 'trim' }">
+        <div class="cut-headline" :class="{ trim: currentStep?.kind === 'trim', grain: currentStep?.grainCross }">
           <template v-if="currentStep">
             <b>
               第 {{ currentStep.order + 1 }} 刀
-              （{{ currentStep.kind === 'trim' ? '修边' : '贯通裁切' }}）：
+              <template v-if="currentStep.kind === 'trim'">（修边）</template>
+              <template v-else-if="currentStep.grainCross">（连纹横断刀 · G{{ currentStep.grainGroupNo }}）</template>
+              <template v-else>（贯通裁切）</template>：
             </b>
             {{ currentStep.label }}
+            <span v-if="currentStep.grainCross" class="grain-note">
+              此刀把同组门板沿纹理分块，断刀后两侧门纹仍按同一方向相接（组内断口以此刀为界）。
+            </span>
           </template>
           <template v-else>
             <b>准备就绪</b>
-            <span class="muted"> 点「播放」从修边刀开始，灰线 = 已下刀，红线 = 当前刀。</span>
+            <span class="muted"> 灰线 = 已下刀，红线 = 当前刀，<b class="amber">棕色虚线 = 连纹横断刀</b>。</span>
           </template>
         </div>
         <div class="svg-wrap">
@@ -130,11 +135,14 @@ function printCut(): void {
           v-for="st in sheet.steps"
           :key="st.order"
           class="step-row"
-          :class="{ active: st.order === cur, trim: st.kind === 'trim' }"
+          :class="{ active: st.order === cur, trim: st.kind === 'trim', grain: st.grainCross }"
           @click="jumpTo(st.order)"
         >
           <span class="n">{{ st.order + 1 }}</span>
-          <span class="t">{{ st.label }}</span>
+          <span class="t">
+            {{ st.label }}
+            <em v-if="st.grainCross" class="grain-badge">连纹 G{{ st.grainGroupNo }}</em>
+          </span>
         </div>
       </aside>
     </div>
@@ -170,6 +178,34 @@ function printCut(): void {
 .cut-headline.trim {
   background: #fffbeb;
   border-color: #f0d9b5;
+}
+.cut-headline.grain {
+  background: #fff7ed;
+  border-color: #d6a55e;
+}
+.grain-note {
+  display: block;
+  font-size: 12px;
+  color: #92400e;
+  margin-top: 3px;
+}
+.amber {
+  color: #b45309;
+}
+.step-row.grain {
+  border-left-color: #b45309;
+}
+.step-row.grain .n {
+  background: #b45309;
+}
+.grain-badge {
+  font-style: normal;
+  background: #fef3c7;
+  color: #92400e;
+  border-radius: 999px;
+  padding: 0 7px;
+  margin-left: 6px;
+  font-size: 11px;
 }
 .svg-wrap {
   border: 1px solid var(--c-line);

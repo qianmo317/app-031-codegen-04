@@ -4,6 +4,14 @@ import { orderSegs, type Rect, type RawSeg, EPS, type PlacedRect } from './geome
 
 export interface DSeg extends RawSeg {
   deps: DSeg[]
+  // 成组连纹段内刀（横断刀 / 矮件上方余隙刀）
+  grainCross?: boolean
+  grainGroupId?: string
+  grainGroupNo?: number
+  grainSegmentId?: string
+  // 物理刀身份：同一把物理刀（如相邻余隙的同一条线）才可合并；
+  // 段内刀每一把都有独立身份，避免把不同门板边界误并成一条贯通刀。
+  cutKey?: string
 }
 
 interface GSeg {
@@ -24,8 +32,15 @@ function mergeDSegs(raw: DSeg[], kerf: number): GSeg[] {
       if (g.axis === s.axis && Math.abs(g.at - s.at) < 0.02) {
         const gap = Math.max(g.lo, s.lo) - Math.min(g.hi, s.hi)
         if (gap <= kerf + 0.6) {
-          target = g
-          break
+          // 物理刀身份不同（段内不同门板边界）即使同坐标也不合并，
+          // 否则会把隔着门板宽度的两段并成一把切穿门板的“贯通刀”。
+          const keyMismatch =
+            (s.cutKey !== undefined || g.src.some((x) => x.cutKey !== undefined)) &&
+            g.src.some((x) => x.cutKey !== s.cutKey)
+          if (!keyMismatch) {
+            target = g
+            break
+          }
         }
       }
     }
@@ -67,6 +82,7 @@ function buildInternalSteps(raw: DSeg[], kerf: number, boardIndex: number, start
   const byId = new Map(groups.map((g) => [g.id, g]))
   return ordered.map((s, i) => {
     const g = byId.get(s.id)!
+    const grainSrc = g.src.find((x) => x.grainCross)
     return {
       boardIndex,
       axis: g.axis,
@@ -77,7 +93,15 @@ function buildInternalSteps(raw: DSeg[], kerf: number, boardIndex: number, start
       label:
         g.axis === 'v'
           ? `沿 X = ${Math.round(g.at)}mm 竖切，贯通 ${Math.round(g.hi - g.lo)}mm`
-          : `沿 Y = ${Math.round(g.at)}mm 横切，贯通 ${Math.round(g.hi - g.lo)}mm`
+          : `沿 Y = ${Math.round(g.at)}mm 横切，贯通 ${Math.round(g.hi - g.lo)}mm`,
+      ...(grainSrc
+        ? {
+            grainCross: true,
+            grainGroupId: grainSrc.grainGroupId,
+            grainGroupNo: grainSrc.grainGroupNo,
+            grainSegmentId: grainSrc.grainSegmentId
+          }
+        : {})
     }
   })
 }

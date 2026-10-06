@@ -70,13 +70,38 @@ function exportJson(): void {
       <router-link :to="`/parts/${job.id}`"><button class="primary">去录零件并排样</button></router-link>
     </section>
 
+    <!-- 成组连纹版本与单据作废状态 -->
+    <section v-if="job.result && job.result.grainGroups.length > 0" class="panel" style="margin-top: 14px">
+      <h3 style="font-size: 14px; margin-bottom: 6px">连纹版本与领料单状态</h3>
+      <p class="small">
+        当前排样连纹版本：<b>{{ job.result.grainVersion.slice(0, 10) }}</b>
+        （组号/板号/断口以此为准）。
+      </p>
+      <p v-if="job.grainIssued" class="small" style="color:#166534">
+        已导出领料单：版本 {{ job.grainIssued.version.slice(0, 10) }}，
+        签发于 {{ new Date(job.grainIssued.issuedAt).toLocaleString('zh-CN') }}，
+        用板 {{ job.grainIssued.boardsUsed }} 张（{{ job.grainIssued.groupDesc }}）。
+        此后若改动组内件数/顺序，旧分组、旧领料单与旧拼版图会自动作废。
+      </p>
+      <div v-if="job.grainVoid" class="void-box">
+        <b>⚠ 上一版领料单与拼版图已作废</b><br />
+        旧版 {{ job.grainVoid.oldVersion.slice(0, 10) }}（签发于
+        {{ new Date(job.grainVoid.issuedAt).toLocaleString('zh-CN') }}）对应的分组已改动，
+        请勿再按旧单领料、开料；请按当前版本 {{ job.grainVoid.currentVersion.slice(0, 10) }} 重新导出。
+        {{ job.grainVoid.reason }}
+      </div>
+      <p v-if="!job.grainIssued && !job.grainVoid" class="small muted">
+        尚未导出领料单。勾选「下料单/领料单」打印即登记本机版本。
+      </p>
+    </section>
+
     <section class="panel" style="margin-top: 14px">
       <h3 style="font-size: 14px; margin-bottom: 8px">导出内容预览（与打印一致）</h3>
       <ul class="small muted">
-        <li>排样图：{{ job.result?.sheets.length ?? 0 }} 张板，同柜同色，标注编号与尺寸</li>
-        <li>裁切步骤：{{ job.result?.sheets.reduce((a, s) => a + s.steps.length, 0) ?? 0 }} 条刀序（含修边）</li>
-        <li>下料单：{{ job.result ? Object.keys(job.result.boardsByType).length : 0 }} 种板材领料 + 按柜明细 + 封边五金</li>
-        <li>标签：{{ job.result?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0 }} 张（每块零件 1 张）</li>
+        <li>排样图：{{ job.result?.sheets.length ?? 0 }} 张板，同柜同色，标注编号与尺寸，连纹门板加组号-段号包络框</li>
+        <li>裁切步骤：{{ job.result?.sheets.reduce((a, s) => a + s.steps.length, 0) ?? 0 }} 条刀序（含修边与连纹横断刀）</li>
+        <li>下料单：{{ job.result ? Object.keys(job.result.boardsByType).length : 0 }} 种板材领料 + 成组连纹/断口 + 按柜明细 + 封边五金</li>
+        <li>标签：{{ job.result?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0 }} 张（每块零件 1 张，含连纹组号）</li>
       </ul>
     </section>
   </div>
@@ -103,5 +128,15 @@ function exportJson(): void {
 }
 .sec-item input {
   margin-top: 3px;
+}
+.void-box {
+  margin-top: 8px;
+  border: 1px solid #dc2626;
+  background: #fef2f2;
+  color: #991b1b;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.7;
 }
 </style>

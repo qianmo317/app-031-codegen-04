@@ -1,9 +1,19 @@
 // 全局状态：Vue reactive 单例 + localStorage 持久化（无 Pinia/Vuex）
 import { reactive, computed } from 'vue'
-import type { Board, Job, NestResult, Part, RegisteredOffcut, SheetResult } from '../types'
+import type {
+  Board,
+  GrainGroupDef,
+  GroupOrderPolicy,
+  Job,
+  NestResult,
+  Part,
+  RegisteredOffcut,
+  SheetResult
+} from '../types'
 import { nestJob } from './packing'
 import { rebuildFromPlacements } from './cuts'
 import { guillotineViolation } from './geometry'
+import { diffGrainResults, grainGroupDesc, grainSignature } from './grain'
 import { uid } from './format'
 import boardsData from '../data/boards.json'
 
@@ -84,7 +94,11 @@ export function createJob(name: string): Job {
     kerfMm: boardsData.defaults.kerfMm,
     trimMm: boardsData.defaults.trimMm,
     useOffcutIds: [],
-    batchByCabinet: false
+    batchByCabinet: false,
+    grainGroups: [],
+    grainPolicy: 'long-first',
+    grainIssued: null,
+    grainVoid: null
   }
   state.jobs.unshift(job)
   persist()
@@ -140,7 +154,21 @@ function boardsWithOffcuts(job: Job): Board[] {
 
 export function runNest(job: Job): NestResult {
   const effective: Job = { ...job, boards: boardsWithOffcuts(job) }
+  const prev = job.result
   const result = nestJob(effective)
+  // 组内件数/顺序一改：逐条列出组号、断口、受影响板与单据行的变化
+  result.grainDiff = diffGrainResults(prev, result)
+  // 已发单据（本机存档）版本与本次签名不一致 → 上一次分组/领料单/拼版图作废重来
+  if (job.grainIssued && job.grainIssued.version !== result.grainVersion) {
+    job.grainVoid = {
+      oldVersion: job.grainIssued.version,
+      issuedAt: job.grainIssued.issuedAt,
+      currentVersion: result.grainVersion,
+      reason:
+        '分组的件数或顺序已改动，旧排样对应的拼版图与已导出的领料单据全部作废，请按本版重新领料、重新打印'
+    }
+    job.grainIssued = null
+  }
   // 标记被用掉的余料
   const usedOffcutBoardIds = new Set(
     result.sheets.filter((s) => s.boardId.startsWith('offcut_')).map((s) => s.boardId)
@@ -154,6 +182,125 @@ export function runNest(job: Job): NestResult {
   job.result = result
   persist()
   return result
+}
+
+// —— 成组连纹：组定义 CRUD、长/短组取舍、单据版本（作废判定） ——
+
+export function grainGroupsOf(job: Job): GrainGroupDef[] {
+  return job.grainGroups ?? []
+}
+
+export function addGrainGroup(job: Job, memberPartIds: string[] = []): GrainGroupDef {
+  if (!job.grainGroups) job.grainGroups = []
+  const no = job.grainGroups.length + 1
+  const g: GrainGroupDef = {
+    id: uid('gg'),
+    name: `连纹组 G${no}`,
+    memberPartIds,
+    allowSplit: true,
+    concession: ['move', 'split']
+  }
+  job.grainGroups.push(g)
+  persist()
+  return g
+}
+
+export function updateGrainGroup(job: Job, id: string, patch: Partial<GrainGroupDef>): void {
+  const g = job.grainGroups?.find((x) => x.id === id)
+  if (g) {
+    Object.assign(g, patch)
+    persist()
+  }
+}
+
+export function removeGrainGroup(job: Job, id: string): void {
+  if (job.grainGroups) {
+    job.grainGroups = job.grainGroups.filter((g) => g.id !== id)
+    persist()
+  }
+}
+
+/** 同一组内成员上移/下移（改顺序即改连纹首尾相接次序，要整张板重排）。 */
+export function moveGrainMember(job: Job, groupId: string, partId: string, delta: -1 | 1): void {
+  const g = job.grainGroups?.find((x) => x.id === groupId)
+  if (!g) return
+  const i = g.memberPartIds.indexOf(partId)
+  const j = i + delta
+  if (i < 0 || j < 0 || j >= g.memberPartIds.length) return
+  const arr = g.memberPartIds
+  arr.splice(i, 1, arr[j])
+  arr.splice(j, 1, partId)
+  persist()
+}
+
+export function setGrainPolicy(job: Job, policy: GroupOrderPolicy): void {
+  job.grainPolicy = policy
+  persist()
+}
+
+/** 导出领料单时记录版本（本机存档）；之后分组改动会让该版本作废。 */
+export function markGrainIssued(job: Job): void {
+  if (!job.result) return
+  job.grainIssued = {
+    version: job.result.grainVersion,
+    issuedAt: Date.now(),
+    boardsUsed: job.result.boardsUsed,
+    groupDesc: grainGroupDesc(job.result)
+  }
+  job.grainVoid = null
+  persist()
+}
+
+export function clearGrainVoid(job: Job): void {
+  job.grainVoid = null
+  persist()
+}
+
+/** 直接用已有结果回算签名（外部导入时用）。 */
+export function currentGrainSignature(job: Job): string {
+  return job.result ? grainSignature(job.result) : ''
+}
+
+/**
+ * 微调后连纹完整性校验：同一连纹段（同组同段）的门板必须仍在同一张板、
+ * 朝向一致（同 y 或同 x）、沿纹理按 ordinal 首尾相接（净距 = kerf）。
+ * 不满足则拒绝微调，避免手工拖动把长条连纹拆散。
+ */
+function grainContinuityViolation(
+  placements: SheetResult['placements'],
+  kerf: number
+): string | null {
+  const bySeg = new Map<string, SheetResult['placements']>()
+  for (const p of placements) {
+    if (!p.grainSegmentId) continue
+    const arr = bySeg.get(p.grainSegmentId) ?? []
+    arr.push(p)
+    bySeg.set(p.grainSegmentId, arr)
+  }
+  for (const [, ps] of bySeg) {
+    if (ps.length < 2) continue
+    const ord = [...ps].sort((a, b) => (a.grainOrdinal ?? 0) - (b.grainOrdinal ?? 0))
+    const boardSet = new Set(ord.map((p) => p.boardIndex))
+    if (boardSet.size > 1) return `连纹段 G${ord[0].grainGroupNo}-${ord[0].grainSegmentNo} 被挪到不同板，连纹会断`
+    // 判定沿 x 还是沿 y：首两件投影
+    const alongX = Math.abs(ord[1].y - ord[0].y) < 0.1
+    const sameLine = ord.every((p) =>
+      alongX ? Math.abs(p.y - ord[0].y) < 0.1 : Math.abs(p.x - ord[0].x) < 0.1
+    )
+    if (!sameLine) return `连纹段 G${ord[0].grainGroupNo}-${ord[0].grainSegmentNo} 门板被错开，纹理方向不再一致`
+    for (let i = 1; i < ord.length; i++) {
+      const a = ord[i - 1]
+      const b = ord[i]
+      const gap = alongX ? b.x - (a.x + a.lenMm) : b.y - (a.y + a.widMm)
+      if (Math.abs(gap - kerf) > 0.6)
+        return `连纹段 G${b.grainGroupNo}-${b.grainSegmentNo} 第 ${b.grainOrdinal} 扇与前扇脱离（缝 ${gap.toFixed(1)}mm），纹理接不上`
+      if (alongX && Math.abs(b.widMm - a.widMm) > 0.1)
+        return `连纹段 G${b.grainGroupNo}-${b.grainSegmentNo} 门板高度不一致，纹理无法对齐`
+      if (!alongX && Math.abs(b.lenMm - a.lenMm) > 0.1)
+        return `连纹段 G${b.grainGroupNo}-${b.grainSegmentNo} 门板宽度不一致，纹理无法对齐`
+    }
+  }
+  return null
 }
 
 /** 手工微调：移动/交换后重新校验 guillotine 并重算刀路；非法返回错误信息。 */
@@ -176,6 +323,9 @@ export function applyAdjustment(
     job.kerfMm
   )
   if (violation) return violation
+  // 连纹完整性：微调后同一连纹段仍须同板、同朝向、沿纹理首尾相接
+  const grainErr = grainContinuityViolation(placements, job.kerfMm)
+  if (grainErr) return grainErr
   const rebuilt = rebuildFromPlacements(
     sheet.wMm,
     sheet.hMm,
@@ -337,6 +487,19 @@ export function createSampleJob(): Job {
     P('BB-G', '吊柜背板', 690, 764, 1, 'none', [], '吊柜', false, back.id),
     P('BB-W', '衣柜背板(竖纹)', 2180, 900, 2, 'length', [], '衣柜', false, back.id)
   ]
+  // 示例连纹组：同一面衣柜并排 4 扇门板纹理首尾相接（让步顺序：先整组挪板，再拆段）
+  const wardrobeDoors = job.parts.filter((p) => p.code === 'WR-M')
+  if (wardrobeDoors.length > 0) {
+    job.grainGroups = [
+      {
+        id: uid('gg'),
+        name: '衣柜门板连纹 G1（4 扇并排）',
+        memberPartIds: wardrobeDoors.map((p) => p.id),
+        allowSplit: true,
+        concession: ['move', 'split']
+      }
+    ]
+  }
   return job
 }
 

@@ -1,10 +1,12 @@
 // 自动化断言（规格书 §8/§10 强制）：
 // guillotine 100 组随机零反例、纹理零旋转、锯路/修边、守恒、封边复算、
 // 30 零件锯切工步 ≤20 且模拟器还原、余料再利用、300 零件性能 <1.5s。
-import type { Board, Job, Part } from '../types'
+// 成组连纹：同板同向首尾相接、断口位置、让步拆段、长/短组取舍、版本签名/diff。
+import type { Board, GrainGroupDef, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import { diffGrainResults, grainSignature } from './grain'
 
 export interface CheckResult {
   name: string
@@ -413,8 +415,7 @@ export function runSelfTest(): SelfTestReport {
   }
 
   // 9) 多板种混排 + 库存张数约束
-  {
-    const thin = makeBoard({
+  {    const thin = makeBoard({
       id: 'thin',
       name: '背板 2440×1220×9',
       wMm: 2440,
@@ -438,6 +439,193 @@ export function runSelfTest(): SelfTestReport {
       '多板种混排且 18mm 库存仅 1 张时超开并提示补采',
       ok,
       `18mm 用 ${thickSheets} 张（库存 1，需补采）、9mm 用 ${thinSheets} 张`
+    )
+  }
+
+  // 10) 成组连纹：3 扇竖纹门板整段同板、同朝向、沿 x 首尾相接，中间不插件
+  {
+    const mk = (c: string): Part =>
+      makePart({ code: c, name: '门板', lenMm: 500, widMm: 700, qty: 1, grain: 'length', edgeBands: ['top', 'bottom', 'left', 'right'] })
+    const parts = [mk('D1'), mk('D2'), mk('D3')]
+    const group: GrainGroupDef = {
+      id: 'gg1',
+      name: 'G1',
+      memberPartIds: parts.map((p) => p.id),
+      allowSplit: false,
+      concession: ['move', 'split']
+    }
+    const job = makeJob(parts, { grainGroups: [group] } as Partial<Job>)
+    const r = nestJob(job)
+    const g = r.grainGroups.find((x) => x.id === 'gg1')
+    const pls = r.sheets.flatMap((s) => s.placements).filter((p) => p.grainGroupId === 'gg1')
+    const sameSheet = new Set(pls.map((p) => p.boardIndex)).size === 1
+    const sameY = pls.every((p) => Math.abs(p.y - pls[0].y) < 1e-6)
+    const noRotate = pls.every((p) => !p.rotated)
+    const ordered = [...pls].sort((a, b) => (a.grainOrdinal ?? 0) - (b.grainOrdinal ?? 0))
+    const chained = ordered.every((p, i) => i === 0 || Math.abs(p.x - (ordered[i - 1].x + 500) - 3.2) < 1e-6)
+    const segLenOk = g?.segments[0].lengthMm === 1506
+    const areaOk = g?.segments[0].areaMm2 === 1050000
+    const simsOk = r.sheets.every((s) => simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements).ok)
+    const ok =
+      !!g && g.segmentCount === 1 && g.breaks.length === 0 && sameSheet && sameY && noRotate && chained &&
+      !!segLenOk && !!areaOk && simsOk
+    add(
+      '成组连纹：整组同板同向沿纹理首尾相接、连纹长度/面积取整正确',
+      ok,
+      ok
+        ? `1 段 ${g!.segments[0].lengthMm}mm、${g!.segments[0].areaMm2}mm²，顺序 ${ordered.map((p) => p.code).join('→')}`
+        : `同板${sameSheet} 同y${sameY} 不转${noRotate} 相接${chained} 长${segLenOk} 面${areaOk} 模拟${simsOk}`
+    )
+  }
+
+  // 11) 连纹段内沿纹理方向不允许插入别家件（占位验证）
+  {
+    const doors = ['E1', 'E2'].map((c) => makePart({ code: c, lenMm: 400, widMm: 300, grain: 'length' }))
+    const filler = makePart({ code: 'FZ', lenMm: 120, widMm: 120, grain: 'none' })
+    const group: GrainGroupDef = {
+      id: 'gg2',
+      name: 'G2',
+      memberPartIds: doors.map((p) => p.id),
+      allowSplit: false,
+      concession: ['move']
+    }
+    const job = makeJob([...doors, filler], { grainGroups: [group] } as Partial<Job>)
+    const r = nestJob(job)
+    const e1 = r.sheets.flatMap((s) => s.placements).find((p) => p.code === 'E1')!
+    const e2 = r.sheets.flatMap((s) => s.placements).find((p) => p.code === 'E2')!
+    const fz = r.sheets.flatMap((s) => s.placements).find((p) => p.code === 'FZ')!
+    const inBand = fz.y >= e1.y - 0.01 && fz.y + fz.widMm <= e1.y + e1.widMm + 0.01
+    const betweenX = fz.x >= e1.x + e1.lenMm - 0.01 && fz.x + fz.lenMm <= e2.x + 0.01
+    const chained = Math.abs(e2.x - (e1.x + e1.lenMm) - 3.2) < 1e-6
+    const simsOk = r.sheets.every((s) => simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements).ok)
+    add(
+      '成组连纹：段内沿纹理首尾相接、中间不插别家件',
+      chained && !(inBand && betweenX) && simsOk,
+      `E2.x-E1.x 间隔 ${Math.round(e2.x - e1.x - e1.lenMm)}mm，填缝件${inBand && betweenX ? '错误插入' : '未插入段内'}`
+    )
+  }
+
+  // 12) 整组超过单板长度：move 走不通时 forced 拆 2 段，断口标明拆点
+  {
+    const doors = ['L1', 'L2', 'L3', 'L4'].map((c) =>
+      makePart({ code: c, lenMm: 700, widMm: 500, grain: 'length' })
+    )
+    const group: GrainGroupDef = {
+      id: 'gg3',
+      name: 'G3',
+      memberPartIds: doors.map((p) => p.id),
+      allowSplit: false,
+      concession: ['move']
+    }
+    const job = makeJob(doors, { grainGroups: [group] } as Partial<Job>)
+    const r = nestJob(job)
+    const g = r.grainGroups.find((x) => x.id === 'gg3')
+    const ok =
+      !!g &&
+      g.segmentCount === 2 &&
+      g.breaks.length === 1 &&
+      g.breaks[0].reason === 'forced' &&
+      g.breaks[0].beforeCode === 'L3' &&
+      g.breaks[0].afterCode === 'L4' &&
+      r.unplaced.length === 0
+    const simsOk = r.sheets.every((s) => simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements).ok)
+    add(
+      '成组连纹：超长组被迫拆两段，断口位置与 forced 原因明确',
+      ok && simsOk,
+      ok ? `段长 ${g!.segmentLengthsMm.join('/')}mm，断口 L3→L4` : JSON.stringify(g?.breaks)
+    )
+  }
+
+  // 13) 让步顺序 split：已开板边角能放前缀时按让步拆段（concession 断口）
+  {
+    const a = ['A1', 'A2', 'A3', 'A4'].map((c) =>
+      makePart({ code: c, lenMm: 430, widMm: 500, grain: 'length' })
+    )
+    const b = ['B1', 'B2', 'B3'].map((c) =>
+      makePart({ code: c, lenMm: 400, widMm: 700, grain: 'length' })
+    )
+    const groups: GrainGroupDef[] = [
+      { id: 'gA', name: 'GA', memberPartIds: a.map((p) => p.id), allowSplit: true, concession: ['move', 'split'] },
+      { id: 'gB', name: 'GB', memberPartIds: b.map((p) => p.id), allowSplit: true, concession: ['split', 'move'] }
+    ]
+    const job = makeJob([...a, ...b], { grainGroups: groups } as Partial<Job>)
+    const r = nestJob(job)
+    const gB = r.grainGroups.find((x) => x.id === 'gB')
+    const bk = gB?.breaks[0]
+    const ok =
+      !!gB && gB.segmentCount === 2 &&
+      bk?.reason === 'concession' &&
+      bk.beforeCode === 'B1' && bk.afterCode === 'B2' &&
+      gB.segments[0].boardIndex === 0 && gB.segments[1].boardIndex === 1
+    const simsOk = r.sheets.every((s) => simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements).ok)
+    add(
+      '成组连纹：按写明让步 split 拆段，前缀填边角、后段去新板',
+      !!ok && simsOk,
+      ok ? `B 组 ${gB!.segmentLengthsMm.join('/')}mm，断口 B1→B2（1板→2板）` : JSON.stringify(gB?.segments.map((s) => [s.boardIndex, s.memberCodes.join()]))
+    )
+  }
+
+  // 14) 单成员组/未绑组件不出断口
+  {
+    const d1 = makePart({ code: 'SOLO', lenMm: 400, widMm: 300, grain: 'length' })
+    const f1 = makePart({ code: 'LOOSE', lenMm: 300, widMm: 300, grain: 'none' })
+    const job = makeJob([d1, f1], {
+      grainGroups: [{ id: 'g1', name: 'G1', memberPartIds: [d1.id], allowSplit: false, concession: ['move'] }]
+    } as Partial<Job>)
+    const r = nestJob(job)
+    const noBreak = r.grainGroups.every((g) => g.breaks.length === 0)
+    const noTag = r.sheets.flatMap((s) => s.placements).every((p) => !p.grainSegmentId)
+    add('单成员组与零散件不出断口、不带连纹段标记', noBreak && noTag, '')
+  }
+
+  // 15) 混高门板长条：高门/矮门同条，矮门上方余隙切给填缝件，切割模拟零反例
+  {
+    const tall = ['H1', 'H2', 'H3'].map((c) => makePart({ code: c, lenMm: 500, widMm: 600, grain: 'length' }))
+    const low = ['L1', 'L2', 'L3'].map((c) => makePart({ code: c, lenMm: 500, widMm: 400, grain: 'length' }))
+    const fill = ['Z1', 'Z2', 'Z3'].map((c) => makePart({ code: c, lenMm: 400, widMm: 180, grain: 'none' }))
+    const job = makeJob([...tall, ...low, ...fill], {
+      grainGroups: [
+        { id: 'gmx', name: 'GMX', memberPartIds: [...tall, ...low].map((p) => p.id), allowSplit: true, concession: ['move', 'split'] }
+      ]
+    } as Partial<Job>)
+    const r = nestJob(job)
+    const g = r.grainGroups.find((x) => x.id === 'gmx')
+    const simsOk = r.sheets.every((s) => simulate(s.wMm, s.hMm, job.kerfMm, s.steps, s.placements).ok)
+    const placed = r.sheets.reduce((a, s) => a + s.placements.length, 0)
+    // 填缝件应落在矮门（400 高）上方，而不是高门上方
+    const zPlacedInLowBand = r.sheets
+      .flatMap((s) => s.placements)
+      .filter((p) => p.code.startsWith('Z'))
+      .every((z) => z.y >= 411 - 1)
+    add(
+      '成组连纹：混高长条矮门上方余隙可填缝且 guillotine 模拟通过',
+      simsOk && placed === 9 && !!g && zPlacedInLowBand,
+      `就位 ${placed}/9，段 ${g?.segmentLengthsMm.join('/')}，模拟 ${simsOk}`
+    )
+  }
+
+  // 16) 版本签名：组号/段号/顺序改动签名必变；diff 列出变化件与受影响板
+  {    const mk = () =>
+      ['V1', 'V2', 'V3'].map((c) => makePart({ code: c, lenMm: 400, widMm: 300, grain: 'length' }))
+    const p1 = mk()
+    const j1 = makeJob(p1, {
+      grainGroups: [{ id: 'gv', name: 'GV', memberPartIds: p1.map((p) => p.id), allowSplit: false, concession: ['move'] }]
+    } as Partial<Job>)
+    const r1 = nestJob(j1)
+    const sig1 = grainSignature(r1)
+    const p2 = mk()
+    const j2 = makeJob(p2, {
+      grainGroups: [{ id: 'gv', name: 'GV', memberPartIds: [p2[2].id, p2[1].id, p2[0].id], allowSplit: false, concession: ['move'] }]
+    } as Partial<Job>)
+    const r2 = nestJob(j2)
+    const sig2 = grainSignature(r2)
+    const diff = diffGrainResults(r1, r2)
+    const changed = diff?.instanceChanges.some((c) => c.code === 'V1' || c.code === 'V3')
+    const boards = (diff?.affectedBoards.length ?? 0) >= 1
+    add(
+      '成组连纹：组内顺序改动签名变化，diff 列出变化件与受影响板',
+      sig1 !== sig2 && !!changed && boards,
+      `签名${sig1 === sig2 ? '未变(错)' : '已变'}；变化件 ${diff?.instanceChanges.length ?? 0}、受影响板 ${diff?.affectedBoards.length ?? 0}`
     )
   }
 

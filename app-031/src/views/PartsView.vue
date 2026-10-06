@@ -7,7 +7,13 @@ import {
   saveJob,
   runNest,
   newPart,
-  allStockTemplates
+  allStockTemplates,
+  grainGroupsOf,
+  addGrainGroup,
+  updateGrainGroup,
+  removeGrainGroup,
+  moveGrainMember,
+  setGrainPolicy
 } from '../lib/store'
 import { uid, parsePartText, parseEdges, money } from '../lib/format'
 import { toast } from '../lib/ui'
@@ -112,6 +118,92 @@ function toggleEdge(p: Part, e: EdgeSide): void {
   else p.edgeBands.push(e)
   save()
 }
+
+// —— 成组连纹 ——
+const grainGroups = computed(() => (job.value ? grainGroupsOf(job.value) : []))
+
+function partOf(id: string): Part | undefined {
+  return job.value?.parts.find((p) => p.id === id)
+}
+function isMemberInOther(gIdx: number, partId: string): boolean {
+  return grainGroups.value.some((g, i) => i !== gIdx && g.memberPartIds.includes(partId))
+}
+function addGroup(): void {
+  if (!job.value) return
+  addGrainGroup(job.value, [])
+  save()
+}
+function removeGroup(id: string): void {
+  if (!job.value) return
+  if (!window.confirm('删除该连纹组？组成员将恢复为零散件（不删除零件本身）。')) return
+  removeGrainGroup(job.value, id)
+  toast('连纹组已删除，成员恢复零散件', 'info')
+}
+function toggleMember(gIdx: number, partId: string): void {
+  if (!job.value) return
+  const g = grainGroups.value[gIdx]
+  if (!g) return
+  const i = g.memberPartIds.indexOf(partId)
+  if (i >= 0) g.memberPartIds.splice(i, 1)
+  else {
+    if (isMemberInOther(gIdx, partId)) {
+      toast('该零件已绑在别的连纹组里，一件只能属于一组', 'bad')
+      return
+    }
+    g.memberPartIds.push(partId)
+  }
+  updateGrainGroup(job.value, g.id, { memberPartIds: [...g.memberPartIds] })
+}
+function moveMember(gIdx: number, partId: string, delta: -1 | 1): void {
+  if (!job.value) return
+  const g = grainGroups.value[gIdx]
+  if (!g) return
+  moveGrainMember(job.value, g.id, partId, delta)
+}
+function toggleConcession(gIdx: number, step: 'move' | 'split'): void {
+  if (!job.value) return
+  const g = grainGroups.value[gIdx]
+  if (!g) return
+  const has = g.concession.includes(step)
+  let next = g.concession.filter((x) => x !== step)
+  if (has) {
+    // 至少保留一种让步
+    if (next.length === 0) {
+      toast('至少保留一种让步（整组挪板 或 拆段）', 'bad')
+      return
+    }
+  } else next = step === 'move' ? ['move', ...next] : [...next, 'split']
+  updateGrainGroup(job.value, g.id, { concession: next })
+}
+function setPolicy(v: 'long-first' | 'short-first'): void {
+  if (!job.value) return
+  setGrainPolicy(job.value, v)
+  save()
+}
+function groupStripLen(gIdx: number): number {
+  const g = grainGroups.value[gIdx]
+  if (!g) return 0
+  let len = 0
+  let n = 0
+  for (const id of g.memberPartIds) {
+    const p = partOf(id)
+    if (!p) continue
+    for (let k = 0; k < p.qty; k++) {
+      len += p.grain === 'width' ? p.widMm : p.lenMm
+      n++
+    }
+  }
+  return n > 0 ? Math.round(len + (n - 1) * (job.value?.kerfMm ?? 3.2)) : 0
+}
+function memberLabel(id: string): string {
+  const p = partOf(id)
+  return p ? `${p.code || '(无编号)'} ${p.lenMm}×${p.widMm}×${p.qty}` : '(已删除)'
+}
+const policyDesc = computed(() =>
+  job.value?.grainPolicy === 'short-first'
+    ? '先排短组：短组先把已开板的边角小板缝填满，省板；代价是长组可能被拆开、整面柜子的花纹断在中间（让出的是连纹完整性）。'
+    : '先排长组：长组优先占整条、保住长条连纹；代价是短组被挤到边角，可能要多开一张板（让出的是省板）。'
+)
 
 const warnings = computed<string[]>(() => {
   const out: string[] = []
@@ -269,6 +361,114 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
       </table>
     </section>
 
+    <!-- 成组连纹 -->
+    <section class="panel" style="margin-bottom: 14px">
+      <div class="row" style="margin-bottom: 6px">
+        <h3 style="font-size: 14px">成组连纹（同一面柜子并排门板，纹理首尾相接）</h3>
+        <span class="tag">连纹长度 mm 取整 · 面积 mm² 取整</span>
+        <div class="spacer" />
+        <button class="sm primary" @click="addGroup">＋ 新建连纹组</button>
+      </div>
+      <p class="small muted" style="margin: 4px 0 10px">
+        把要连纹的门板按拼装顺序绑成一组：它们会落在<strong>同一张板、纹理朝同一方向、沿纹理首尾相接排成一整条</strong>，
+        中间不插别家的件；其余零散件再按老规矩填缝。一件只能属于一组；单成员组不出断口。
+      </p>
+
+      <div class="row wrap" style="gap: 18px; margin-bottom: 10px; align-items: center">
+        <span class="small"><b>同板先排：</b></span>
+        <label class="row small policy-opt" :class="{ on: job.grainPolicy !== 'short-first' }">
+          <input type="radio" :checked="job.grainPolicy !== 'short-first'" @change="setPolicy('long-first')" />
+          <span><b>先排长组（保连纹）</b>：长条不断，短组可能被挤到边角多占一张板</span>
+        </label>
+        <label class="row small policy-opt" :class="{ on: job.grainPolicy === 'short-first' }">
+          <input type="radio" :checked="job.grainPolicy === 'short-first'" @change="setPolicy('short-first')" />
+          <span><b>先排短组（省板）</b>：先填边角小板缝，长组可能被拆开，花纹断在中间</span>
+        </label>
+      </div>
+      <p class="small" style="color: #92600a; margin: 0 0 12px">{{ policyDesc }} 这两条只能选一条。</p>
+
+      <div v-if="grainGroups.length === 0" class="small muted">
+        还没有连纹组。点「新建连纹组」，勾选同一面柜子上要纹理相接的门板。
+      </div>
+
+      <div v-for="(g, gi) in grainGroups" :key="g.id" class="grain-card">
+        <div class="row" style="gap: 8px">
+          <span class="gno">G{{ gi + 1 }}</span>
+          <input v-model="g.name" @change="updateGrainGroup(job!, g.id, { name: g.name })" class="gname" />
+          <span class="tag">{{ g.memberPartIds.length }} 种</span>
+          <span class="tag good">整条约 {{ groupStripLen(gi) }} mm</span>
+          <div class="spacer" />
+          <label class="row small" style="gap: 4px">
+            <input
+              type="checkbox"
+              :checked="g.allowSplit"
+              @change="updateGrainGroup(job!, g.id, { allowSplit: ($event.target as HTMLInputElement).checked })"
+            />
+            允许让步拆段
+          </label>
+          <button class="sm ghost-danger" @click="removeGroup(g.id)">删组</button>
+        </div>
+
+        <div class="row small wrap" style="gap: 6px; margin: 6px 0">
+          <span class="muted">一组排不下时让步顺序：</span>
+          <button
+            class="conc-btn"
+            :class="{ on: g.concession[0] === 'move' }"
+            @click="toggleConcession(gi, 'move')"
+            title="整组挪到下一张板，连纹不断"
+          >① 整组挪下一张板</button>
+          <button
+            class="conc-btn"
+            :class="{ on: g.concession.includes('split'), off: !g.allowSplit }"
+            :disabled="!g.allowSplit"
+            @click="toggleConcession(gi, 'split')"
+            title="按最长前缀拆成两段各自纹理连续的组，断口会标明"
+          >{{ g.concession[0] === 'split' ? '① 拆成两段（各自连续）' : '② 拆成两段（各自连续）' }}</button>
+          <span class="muted">当前顺序：{{ g.concession.map((c) => (c === 'move' ? '整组挪板' : '拆段')).join(' → ') }}</span>
+        </div>
+
+        <!-- 已绑成员（可排序=连纹首尾次序） -->
+        <div v-if="g.memberPartIds.length > 0" class="member-chain">
+          <template v-for="(id, mi) in g.memberPartIds" :key="id">
+            <div class="member-chip" :class="{ invalid: !partOf(id) }">
+              <span class="ord">{{ mi + 1 }}</span>
+              <span>{{ memberLabel(id) }}</span>
+              <span class="chip-actions">
+                <button class="xs" :disabled="mi === 0" @click="moveMember(gi, id, -1)">←</button>
+                <button class="xs" :disabled="mi === g.memberPartIds.length - 1" @click="moveMember(gi, id, 1)">→</button>
+                <button class="xs ghost-danger" @click="toggleMember(gi, id)">×</button>
+              </span>
+            </div>
+            <span v-if="mi < g.memberPartIds.length - 1" class="chain-arrow">纹理→</span>
+          </template>
+        </div>
+
+        <!-- 勾选可加入的零件 -->
+        <div class="add-members">
+          <span class="small muted">勾选成员（按勾选顺序沿纹理相接；同一编号数量会逐扇展开）：</span>
+          <div class="row wrap" style="gap: 6px; margin-top: 4px">
+            <label
+              v-for="p in job.parts"
+              :key="p.id"
+              class="pick-cb"
+              :class="{ on: g.memberPartIds.includes(p.id), used: isMemberInOther(gi, p.id) }"
+            >
+              <input
+                type="checkbox"
+                :checked="g.memberPartIds.includes(p.id)"
+                :disabled="isMemberInOther(gi, p.id)"
+                @change="toggleMember(gi, p.id)"
+              />
+              {{ p.code || p.name }} {{ p.lenMm }}×{{ p.widMm }}
+              <i :title="p.grain === 'length' ? '竖纹' : p.grain === 'width' ? '横纹' : '纹理无要求'">
+                {{ p.grain === 'length' ? '竖' : p.grain === 'width' ? '横' : '无' }}
+              </i>
+            </label>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- 零件清单 -->
     <section class="panel">
       <div class="row" style="margin-bottom: 8px">
@@ -365,6 +565,135 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
 </template>
 
 <style scoped>
+.policy-opt {
+  border: 1px solid var(--c-line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+  max-width: 430px;
+}
+.policy-opt.on {
+  border-color: var(--c-primary);
+  background: #fff7ed;
+}
+.grain-card {
+  border: 1px solid var(--c-line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  background: #fcfdfb;
+}
+.gno {
+  background: #1f2a26;
+  color: #f59e0b;
+  font-weight: 700;
+  border-radius: 6px;
+  padding: 3px 9px;
+  font-size: 13px;
+}
+.gname {
+  width: 200px;
+  font-weight: 600;
+}
+.conc-btn {
+  border: 1px solid var(--c-line);
+  background: #fff;
+  border-radius: 999px;
+  padding: 3px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.conc-btn.on {
+  border-color: #b45309;
+  background: #fef3c7;
+  color: #92400e;
+  font-weight: 700;
+}
+.conc-btn.off {
+  opacity: 0.45;
+}
+.member-chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin: 8px 0;
+}
+.member-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d6a55e;
+  background: #fffaf0;
+  border-radius: 6px;
+  padding: 3px 6px 3px 3px;
+  font-size: 12px;
+}
+.member-chip.invalid {
+  border-color: #dc2626;
+  background: #fef2f2;
+}
+.member-chip .ord {
+  background: #b45309;
+  color: #fff;
+  border-radius: 4px;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+}
+.chip-actions {
+  display: inline-flex;
+  gap: 2px;
+}
+button.xs {
+  border: 1px solid var(--c-line);
+  background: #fff;
+  border-radius: 4px;
+  font-size: 11px;
+  padding: 0 5px;
+  line-height: 17px;
+  cursor: pointer;
+}
+button.xs:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.chain-arrow {
+  font-size: 11px;
+  color: #b45309;
+  font-weight: 700;
+}
+.add-members {
+  border-top: 1px dashed var(--c-line-soft);
+  padding-top: 6px;
+}
+.pick-cb {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--c-line);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  background: #fff;
+}
+.pick-cb.on {
+  border-color: #b45309;
+  background: #fff7ed;
+  font-weight: 600;
+}
+.pick-cb.used {
+  opacity: 0.5;
+}
+.pick-cb i {
+  font-style: normal;
+  color: var(--c-ink-2);
+  font-size: 10px;
+}
 .offcut-chip {
   display: inline-flex;
   align-items: center;
